@@ -633,3 +633,158 @@ class TestGetModuleNamesTiedWithEmbedding:
             modules = peft_model._get_module_names_tied_with_embedding()
 
             assert expected == modules
+
+
+class TestCrossTermsAdapterCombination:
+    """Test that combining adapters with different weights does not introduce cross-terms.
+
+    See https://github.com/huggingface/peft/issues/3004 for details on the bug.
+
+    Previously, ``_generalized_task_arithmetic_weighted_adapter`` applied weights separately
+    to the A and B LoRA matrices using sqrt decomposition. With adapters (A1, B1) and (A2, B2)
+    and weights [1, -1], this resulted in:
+        combined_B @ combined_A = (B1 + B2) @ (A1 - A2) = B1@A1 + B2@A1 - B1@A2 - B2@A2
+    instead of the correct:
+        1 * B1@A1 + (-1) * B2@A2 = B1@A1 - B2@A2
+
+    The cross-terms (B2@A1 and -B1@A2) are mathematically incorrect.
+    """
+
+    @pytest.fixture
+    def model_with_two_adapters(self):
+        """Create a model with two LoRA adapters for testing."""
+        from transformers import OPTConfig, OPTForCausalLM
+
+        torch.manual_seed(0)
+        model = OPTForCausalLM(OPTConfig(vocab_size=100, hidden_size=32, num_attention_heads=4, num_hidden_layers=1))
+        config = LoraConfig(
+            r=4,
+            lora_alpha=4,
+            target_modules=["q_proj", "v_proj"],
+            init_lora_weights=False,
+        )
+        model = get_peft_model(model, config, adapter_name="adapter1")
+        model.add_adapter("adapter2", config)
+        return model
+
+    def _get_lora_targets(self, model):
+        """Get all LoraLayer modules from the model."""
+        from peft.tuners.lora.layer import LoraLayer
+
+        return {name: module for name, module in model.named_modules() if isinstance(module, LoraLayer)}
+
+    def test_linear_combination_no_cross_terms(self, model_with_two_adapters):
+        """Test that linear combination with negative weights avoids cross-terms.
+
+        This is the core test for issue #3004. We verify that the non-SVD 'linear' path
+        produces results consistent with the SVD path (which computes full delta weights
+        first and thus never has cross-terms). Due to SVD rank truncation, the result is
+        an approximation, but it should be identical to the SVD path's result.
+        """
+        model = model_with_two_adapters
+        adapters = ["adapter1", "adapter2"]
+        weights = [1.0, -1.0]
+
+        # Combine using both linear (previously buggy) and svd (always correct) paths
+        model.add_weighted_adapter(adapters, weights, "combined_linear", combination_type="linear")
+        model.add_weighted_adapter(adapters, weights, "combined_svd", combination_type="svd")
+
+        # After the fix, both paths should produce identical results
+        for name, target in self._get_lora_targets(model).items():
+            if "combined_linear" not in target.lora_A or "combined_svd" not in target.lora_A:
+                continue
+            delta_linear = target.get_delta_weight("combined_linear")
+            delta_svd = target.get_delta_weight("combined_svd")
+            assert torch.allclose(delta_linear, delta_svd, atol=1e-4, rtol=1e-4), (
+                f"Cross-terms detected in module {name}: linear and svd paths diverge. "
+                f"max diff = {(delta_linear - delta_svd).abs().max().item()}"
+            )
+
+    def test_linear_combination_consistency_with_svd(self, model_with_two_adapters):
+        """Test that 'linear' and 'svd' combination types produce equivalent results.
+
+        After the fix, the non-SVD path ('linear') computes full delta weights and decomposes
+        via SVD, so it should produce results equivalent to the SVD path.
+        """
+        model = model_with_two_adapters
+        adapters = ["adapter1", "adapter2"]
+        weights = [0.7, -0.3]
+
+        model.add_weighted_adapter(adapters, weights, "combined_linear", combination_type="linear")
+        model.add_weighted_adapter(adapters, weights, "combined_svd", combination_type="svd")
+
+        for name, target in self._get_lora_targets(model).items():
+            if "combined_linear" not in target.lora_A or "combined_svd" not in target.lora_A:
+                continue
+            delta_linear = target.get_delta_weight("combined_linear")
+            delta_svd = target.get_delta_weight("combined_svd")
+            assert torch.allclose(delta_linear, delta_svd, atol=1e-4, rtol=1e-4), (
+                f"Inconsistency between linear and svd in module {name}: "
+                f"max diff = {(delta_linear - delta_svd).abs().max().item()}"
+            )
+
+    @pytest.mark.parametrize("combination_type", ["linear", "ties", "dare_linear", "dare_ties", "magnitude_prune"])
+    def test_all_combination_types_forward_pass(self, model_with_two_adapters, combination_type):
+        """Test that all non-SVD combination types work correctly with negative weights."""
+        model = model_with_two_adapters
+        adapters = ["adapter1", "adapter2"]
+        weights = [0.5, -0.5]
+
+        kwargs = {}
+        if combination_type in ("ties", "dare_linear", "dare_ties", "magnitude_prune"):
+            kwargs["density"] = 0.5
+
+        model.add_weighted_adapter(
+            adapters,
+            weights,
+            f"combined_{combination_type}",
+            combination_type=combination_type,
+            **kwargs,
+        )
+
+        model.set_adapter(f"combined_{combination_type}")
+        model.eval()
+        dummy_input = torch.tensor([[1, 2, 3]])
+        with torch.no_grad():
+            output = model(dummy_input)
+        assert output.logits is not None
+        assert output.logits.shape[-1] == 100  # vocab_size
+
+    def test_positive_weights_no_regression(self, model_with_two_adapters):
+        """Test that positive-weight combinations are consistent between linear and svd paths."""
+        model = model_with_two_adapters
+        adapters = ["adapter1", "adapter2"]
+        weights = [0.5, 0.5]
+
+        # With positive weights, the old code had no cross-terms issue (since cross-terms
+        # only manifest with differing signs). But we still verify consistency with SVD path.
+        model.add_weighted_adapter(adapters, weights, "combined_linear", combination_type="linear")
+        model.add_weighted_adapter(adapters, weights, "combined_svd", combination_type="svd")
+
+        for name, target in self._get_lora_targets(model).items():
+            if "combined_linear" not in target.lora_A or "combined_svd" not in target.lora_A:
+                continue
+            delta_linear = target.get_delta_weight("combined_linear")
+            delta_svd = target.get_delta_weight("combined_svd")
+            assert torch.allclose(delta_linear, delta_svd, atol=1e-4, rtol=1e-4), (
+                f"Regression: linear and svd diverge for module {name}: "
+                f"max diff = {(delta_linear - delta_svd).abs().max().item()}"
+            )
+
+    def test_single_adapter_combination(self, model_with_two_adapters):
+        """Test that combining a single adapter with a weight works correctly."""
+        model = model_with_two_adapters
+        weight = 2.0
+
+        model.add_weighted_adapter(["adapter1"], [weight], "combined_single", combination_type="linear")
+
+        for name, target in self._get_lora_targets(model).items():
+            if "combined_single" not in target.lora_A:
+                continue
+            actual_delta = target.get_delta_weight("combined_single")
+            original_delta = target.get_delta_weight("adapter1")
+            expected = weight * target.scaling["adapter1"] * original_delta
+            assert torch.allclose(actual_delta, expected, atol=1e-4, rtol=1e-4), (
+                f"Single adapter combination wrong for module {name}: "
+                f"max diff = {(actual_delta - expected).abs().max().item()}"
+            )

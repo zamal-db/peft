@@ -13,7 +13,6 @@
 # limitations under the License.
 from __future__ import annotations
 
-import math
 import operator
 import re
 import warnings
@@ -792,48 +791,79 @@ class LoraModel(BaseTuner):
         density,
         majority_sign_method,
     ):
-        # account weights for LoRA A and B layers.
-        valid_weights_A = []
-        valid_weights_B = []
-        lora_A_deltas = []
-        lora_B_deltas = []
+        # Compute full delta weights (B @ A * scaling) for each adapter to avoid cross-terms.
+        # Previously, weights were applied separately to A and B matrices via sqrt decomposition,
+        # which introduced cross-terms when combining multiple adapters with different weights.
+        # For example, with weights [1, -1]: (A1 - A2) @ (B1 + B2) != A1@B1 - A2@B2.
+        # See: https://github.com/huggingface/peft/issues/3004
+        valid_adapters = []
+        valid_weights = []
+        is_embedding = any(adapter in target.lora_embedding_A for adapter in adapters)
         for adapter, weight in zip(adapters, weights):
-            if adapter in target.lora_A:
-                current_adapter_lora_A = target.lora_A[adapter].weight
-                current_adapter_lora_B = target.lora_B[adapter].weight
-            elif adapter in target.lora_embedding_A:
-                current_adapter_lora_A = target.lora_embedding_A[adapter]
-                current_adapter_lora_B = target.lora_embedding_B[adapter]
+            if adapter in target.lora_A or adapter in target.lora_embedding_A:
+                valid_adapters.append(adapter)
+                valid_weights.append(weight * target.scaling[adapter])
+
+        if len(valid_adapters) == 0:
+            raise ValueError("No matching LoRAs found. Please raise an issue on GitHub.")
+
+        # Get shape and dtype info from the first adapter for reshaping after SVD
+        if valid_adapters[0] in target.lora_A:
+            dtype = target.lora_A[valid_adapters[0]].weight.dtype
+            lora_A_shape = target.lora_A[valid_adapters[0]].weight.shape
+            lora_B_shape = target.lora_B[valid_adapters[0]].weight.shape
+        else:
+            dtype = target.lora_embedding_A[valid_adapters[0]].dtype
+            lora_A_shape = target.lora_embedding_A[valid_adapters[0]].shape
+            lora_B_shape = target.lora_embedding_B[valid_adapters[0]].shape
+
+        # Compute full delta weights to avoid cross-terms
+        delta_weights = [target.get_delta_weight(adapter) for adapter in valid_adapters]
+        valid_weights = torch.tensor(valid_weights).to(delta_weights[0].device)
+
+        # Apply the combination method to the full delta weights
+        if combination_type == "linear":
+            combined_delta = task_arithmetic(delta_weights, valid_weights)
+        elif combination_type == "ties":
+            combined_delta = ties(delta_weights, valid_weights, density, majority_sign_method)
+        elif combination_type == "dare_linear":
+            combined_delta = dare_linear(delta_weights, valid_weights, density)
+        elif combination_type == "dare_ties":
+            combined_delta = dare_ties(delta_weights, valid_weights, density, majority_sign_method)
+        elif combination_type == "magnitude_prune":
+            combined_delta = magnitude_prune(delta_weights, valid_weights, density)
+        else:
+            raise ValueError("Invalid combination type")
+
+        # Handle Conv2d layers - flatten for SVD, then reshape back
+        conv2d = isinstance(target, Conv2d)
+        if conv2d:
+            conv2d_1x1 = target.weight.size()[2:4] == (1, 1)
+            if not conv2d_1x1:
+                combined_delta = combined_delta.flatten(start_dim=1)
             else:
-                continue
-            # Support negative weights: take absolute value for sqrt, then apply sign
-            weight_with_scaling = weight * target.scaling[adapter]
-            sign = 1 if weight_with_scaling >= 0 else -1
-            # apply sign only on one side of the weights, otherwise negative signs negate
-            valid_weights_A.append(math.sqrt(abs(weight_with_scaling)) * sign)
-            valid_weights_B.append(math.sqrt(abs(weight_with_scaling)))
-            lora_A_deltas.append(current_adapter_lora_A.data)
-            lora_B_deltas.append(current_adapter_lora_B.data)
-        valid_weights_A = torch.tensor(valid_weights_A).to(lora_A_deltas[0].device)
-        valid_weights_B = torch.tensor(valid_weights_B).to(lora_B_deltas[0].device)
-        valid_weights = [valid_weights_A, valid_weights_B]
-        lora_deltas = [lora_A_deltas, lora_B_deltas]
-        dtype = lora_A_deltas[0].dtype
-        for i, task_tensors in enumerate(lora_deltas):
-            if combination_type == "linear":
-                lora_deltas[i] = task_arithmetic(task_tensors, valid_weights[i])
-            elif combination_type == "ties":
-                lora_deltas[i] = ties(task_tensors, valid_weights[i], density, majority_sign_method)
-            elif combination_type == "dare_linear":
-                lora_deltas[i] = dare_linear(task_tensors, valid_weights[i], density)
-            elif combination_type == "dare_ties":
-                lora_deltas[i] = dare_ties(task_tensors, valid_weights[i], density, majority_sign_method)
-            elif combination_type == "magnitude_prune":
-                lora_deltas[i] = magnitude_prune(task_tensors, valid_weights[i], density)
-            else:
-                raise ValueError("Invalid combination type")
-        lora_deltas = [delta.to(dtype) for delta in lora_deltas]
-        return lora_deltas
+                combined_delta = combined_delta.squeeze()
+
+        # Handle transpose for embeddings and fan_in_fan_out layers
+        if (hasattr(target, "fan_in_fan_out") and target.fan_in_fan_out) or is_embedding:
+            combined_delta = combined_delta.T
+
+        # Decompose combined delta back into lora_A and lora_B using truncated SVD
+        rank = lora_A_shape[0]
+        U, S, Vh = torch.linalg.svd(combined_delta, full_matrices=False)
+        U = U[:, :rank]
+        S = S[:rank]
+        U = U @ torch.diag(S)
+        Vh = Vh[:rank, :]
+
+        # Reshape for Conv2d layers
+        if conv2d:
+            U = U.reshape(lora_B_shape)
+            Vh = Vh.reshape(lora_A_shape)
+
+        lora_A = Vh.to(dtype)
+        lora_B = U.to(dtype)
+        return lora_A, lora_B
 
     def subtract_mutated_init(self, output_state_dict: dict[str, torch.Tensor], adapter_name: str, kwargs=None):
         """
